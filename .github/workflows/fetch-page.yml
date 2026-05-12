@@ -1,10 +1,10 @@
-name: Fetch Full Page & Save to Repo
+name: Fetch Full Page & Index
 
 on:
   workflow_dispatch:
     inputs:
       url:
-        description: 'URL to fetch (full page with all assets)'
+        description: 'URL to fetch'
         required: true
         type: string
 
@@ -20,6 +20,7 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Prepare directory and fetch page with wget
+        id: fetcher
         run: |
           URL="${{ github.event.inputs.url }}"
           TIMESTAMP=$(date -u +%Y%m%d_%H%M%S)
@@ -47,50 +48,47 @@ jobs:
             -e robots=off \
             "$URL"
 
-          # پیدا کردن فایل HTML اصلی (معمولاً index.html یا همان نام فایل)
+          # پیدا کردن فایل HTML اصلی
           MAIN_HTML=$(find "$BASE_PATH" -maxdepth 1 -name '*.html' -type f | head -1)
           if [ -z "$MAIN_HTML" ]; then
-            # اگر با no-host-directories پیداش نشد، شاید داخل یک زیرپوشه باشد (اگر حذفش کنیم)
             MAIN_HTML=$(find "$BASE_PATH" -name '*.html' -type f | head -1)
           fi
-
           if [ -z "$MAIN_HTML" ]; then
-            echo "Error: No HTML file found after download."
+            echo "Error: No HTML found"
             exit 1
           fi
 
           MAIN_REL_PATH=$(realpath --relative-to="$PWD" "$MAIN_HTML")
-
-          # متغیرهای محیطی برای مراحل بعد
-          echo "DIR_NAME=$DIR_NAME" >> $GITHUB_ENV
-          echo "MAIN_REL_PATH=$MAIN_REL_PATH" >> $GITHUB_ENV
-          echo "BASE_PATH=$BASE_PATH" >> $GITHUB_ENV
-
-      - name: Create metadata and link files
-        run: |
           RAW_URL="https://raw.githubusercontent.com/${{ github.repository }}/main/$MAIN_REL_PATH"
-          
-          echo "$RAW_URL" > link.txt
-          cat > metadata.json <<EOF
-          {
-            "original_url": "${{ github.event.inputs.url }}",
-            "saved_directory": "$BASE_PATH",
-            "main_file": "$MAIN_REL_PATH",
-            "raw_link": "$RAW_URL",
-            "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-          }
-          EOF
 
-      - name: Commit and push changes
+          echo "main_file=$MAIN_REL_PATH" >> $GITHUB_OUTPUT
+          echo "raw_url=$RAW_URL" >> $GITHUB_OUTPUT
+          echo "dir_name=$DIR_NAME" >> $GITHUB_OUTPUT
+          echo "timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> $GITHUB_OUTPUT
+
+      - name: Update index.json
+        run: |
+          # اگر index.json وجود نداشت، یک آرایه‌ی جدید بساز
+          if [ ! -f index.json ]; then
+            echo '[]' > index.json
+          fi
+
+          NEW_ENTRY=$(jq -n --arg url "${{ github.event.inputs.url }}" \
+                            --arg main_file "${{ steps.fetcher.outputs.main_file }}" \
+                            --arg raw_url "${{ steps.fetcher.outputs.raw_url }}" \
+                            --arg dir_name "${{ steps.fetcher.outputs.dir_name }}" \
+                            --arg ts "${{ steps.fetcher.outputs.timestamp }}" \
+            '{original_url: $url, main_file: $main_file, raw_url: $raw_url, dir: $dir_name, timestamp: $ts}')
+
+          # به‌روزرسانی فایل: حذف ورودی قدیمی با همان original_url (اگر بود) و افزودن جدید
+          UPDATED=$(jq --argjson entry "$NEW_ENTRY" --arg url "${{ github.event.inputs.url }}" \
+            'map(select(.original_url != $url)) + [$entry]' index.json)
+          echo "$UPDATED" > index.json
+
+      - name: Commit and push
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add fetched_pages/ link.txt metadata.json
-          git diff --staged --quiet || git commit -m "Add fully fetched page from ${{ github.event.inputs.url }}"
+          git add fetched_pages/ index.json
+          git diff --staged --quiet || git commit -m "Save page: ${{ github.event.inputs.url }}"
           git push
-
-      - name: Upload artifact (full directory)
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ env.DIR_NAME }}
-          path: ${{ env.BASE_PATH }}/
