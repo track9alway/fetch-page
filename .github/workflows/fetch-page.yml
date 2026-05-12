@@ -7,6 +7,16 @@ on:
         description: 'URL to fetch (full page with all assets)'
         required: true
         type: string
+      wait_until:
+        description: 'Playwright waitUntil condition (default: networkidle)'
+        required: false
+        default: 'networkidle'
+        type: string
+      extra_wait:
+        description: 'Extra seconds to wait after page load (for dynamic content)'
+        required: false
+        default: '2'
+        type: string
 
 jobs:
   fetch-and-save:
@@ -29,9 +39,9 @@ jobs:
           npx playwright install-deps chromium
           npx playwright install chromium
 
-      - name: Fetch full page with Playwright (stealth + resource saving)
+      - name: Fetch & save page (resilient)
         run: |
-          npm install playwright playwright-extra puppeteer-extra-plugin-stealth archiver
+          npm install playwright playwright-extra puppeteer-extra-plugin-stealth cheerio archiver
           node -e "
           const { chromium } = require('playwright-extra');
           const stealth = require('puppeteer-extra-plugin-stealth')();
@@ -39,121 +49,173 @@ jobs:
           const fs = require('fs');
           const path = require('path');
           const archiver = require('archiver');
+          const cheerio = require('cheerio');
 
           const URL = process.env.INPUT_URL;
+          const WAIT_UNTIL = process.env.INPUT_WAIT_UNTIL || 'networkidle';
+          const EXTRA_WAIT = parseInt(process.env.INPUT_EXTRA_WAIT || '2', 10);
           const TIMESTAMP = new Date().toISOString().replace(/[:.]/g, '-');
           const DIR_NAME = 'fetched_' + TIMESTAMP;
           const BASE_PATH = path.join('fetched_pages', DIR_NAME);
 
-          fs.mkdirSync(BASE_PATH, { recursive: true });
+          try {
+            fs.mkdirSync(BASE_PATH, { recursive: true });
+          } catch (e) {
+            console.error('Could not create base directory:', e.message);
+            process.exit(1);
+          }
 
           (async () => {
-            const browser = await chromium.launch({ headless: true });
-            const context = await browser.newContext({
-              userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
-            });
-            const page = await context.newPage();
+            let browser;
+            try {
+              browser = await chromium.launch({ headless: true });
+              const context = await browser.newContext({
+                userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
+              });
+              const page = await context.newPage();
 
-            // Collect all responses to save assets
-            const assets = new Map();
-            page.on('response', async response => {
+              // Collect all responses (including failed ones optionally)
+              const assetBuffers = new Map();
+              page.on('response', async response => {
+                try {
+                  const url = response.url();
+                  const buffer = await response.body();
+                  assetBuffers.set(url, buffer);
+                } catch (e) {
+                  // ignore single asset failures
+                }
+              });
+
+              // Also intercept requests to ensure we capture all (even blocked ones) – but we only use response for buffer
+              await page.goto(URL, { waitUntil: WAIT_UNTIL, timeout: 90000 });
+              if (EXTRA_WAIT > 0) {
+                await page.waitForTimeout(EXTRA_WAIT * 1000);
+              }
+
+              // Get final HTML
+              const html = await page.content();
+
+              // Save assets to resources folder with safe names
+              const resourceDir = path.join(BASE_PATH, 'resources');
+              fs.mkdirSync(resourceDir, { recursive: true });
+              const linkMap = new Map(); // original URL → local relative path
+
+              for (const [url, buffer] of assetBuffers) {
+                try {
+                  const parsed = new URL(url);
+                  let safeName = parsed.pathname.replace(/[<>:\"|?*\\r\\n]/g, '_');
+                  if (!safeName || safeName === '/') safeName = '/index';
+                  // preserve query string as part of filename (to differentiate e.g. ?v=1)
+                  if (parsed.search) {
+                    safeName += parsed.search.replace(/[<>:\"|?*\\r\\n]/g, '_');
+                  }
+                  // remove leading slash for relative path
+                  if (safeName.startsWith('/')) safeName = safeName.slice(1);
+                  const outPath = path.join(resourceDir, safeName);
+                  fs.mkdirSync(path.dirname(outPath), { recursive: true });
+                  fs.writeFileSync(outPath, buffer);
+                  linkMap.set(url, './resources/' + safeName.replace(/\\/g, '/'));
+                } catch (e) {
+                  // Skip asset that can't be saved
+                }
+              }
+
+              // Rewrite HTML using Cheerio for robust replacement
+              const $ = cheerio.load(html);
+              // Elements with src/href/srcset
+              $('[src]').each((i, el) => {
+                const src = $(el).attr('src');
+                if (src && linkMap.has(src)) {
+                  $(el).attr('src', linkMap.get(src));
+                }
+              });
+              $('[href]').each((i, el) => {
+                const href = $(el).attr('href');
+                if (href && linkMap.has(href)) {
+                  $(el).attr('href', linkMap.get(href));
+                }
+              });
+              // handle srcset (img, source)
+              $('[srcset]').each((i, el) => {
+                const srcset = $(el).attr('srcset');
+                if (srcset) {
+                  const parts = srcset.split(',').map(part => {
+                    const [url, ...rest] = part.trim().split(/\s+/);
+                    if (url && linkMap.has(url)) {
+                      return linkMap.get(url) + (rest.length ? ' ' + rest.join(' ') : '');
+                    }
+                    return part.trim();
+                  });
+                  $(el).attr('srcset', parts.join(', '));
+                }
+              });
+              const rewrittenHtml = $.html();
+              fs.writeFileSync(path.join(BASE_PATH, 'index.html'), rewrittenHtml);
+
+              await browser.close();
+              browser = null;
+
+              // Try to create ZIP, but do not fail if impossible
+              let zipPath = '';
               try {
-                const url = response.url();
-                const buffer = await response.body();
-                assets.set(url, buffer);
-              } catch (e) {}
-            });
+                const outputZip = path.join(BASE_PATH + '.zip');
+                const output = fs.createWriteStream(outputZip);
+                const archive = archiver('zip', { zlib: { level: 9 } });
+                archive.pipe(output);
+                archive.directory(BASE_PATH, DIR_NAME);
+                await archive.finalize();
+                zipPath = outputZip;
+                console.log('Zip created:', outputZip);
+              } catch (zipErr) {
+                console.warn('Zip creation failed, continuing without ZIP:', zipErr.message);
+              }
 
-            await page.goto(URL, { waitUntil: 'networkidle', timeout: 60000 });
-
-            // Get final HTML after all JS
-            const html = await page.content();
-            fs.writeFileSync(path.join(BASE_PATH, 'index.html'), html);
-
-            // Save collected assets with safe filenames
-            const resourceDir = path.join(BASE_PATH, 'resources');
-            fs.mkdirSync(resourceDir, { recursive: true });
-
-            for (const [url, buffer] of assets) {
-              try {
-                const parsed = new URL(url);
-                // Sanitise path: replace invalid characters with '_'
-                let safePath = parsed.pathname.replace(/[<>:\"|?*\\r\\n]/g, '_');
-                if (!safePath || safePath === '/') safePath = '/index';
-                // Remove leading slash for relative saving
-                if (safePath.startsWith('/')) safePath = safePath.slice(1);
-                // Preserve extension from query if any? We'll just keep original path
-                const fullPath = path.join(resourceDir, safePath);
-                fs.mkdirSync(path.dirname(fullPath), { recursive: true });
-                fs.writeFileSync(fullPath, buffer);
-              } catch (e) {}
+              // Output variables for next steps
+              console.log('DIR_NAME=' + DIR_NAME);
+              console.log('ZIP_PATH=' + (zipPath || ''));
+            } catch (err) {
+              console.error('Fetch failed:', err.message);
+              if (browser) await browser.close();
+              // Still output DIR_NAME so that folder can be committed if partially created
+              console.log('DIR_NAME=' + DIR_NAME);
+              console.log('ZIP_PATH=');
             }
-
-            // Create a mapping from original URL to local relative path
-            // (used to rewrite HTML)
-            const linkMap = {};
-            assets.forEach((_, url) => {
-              try {
-                const parsed = new URL(url);
-                let safePath = parsed.pathname.replace(/[<>:\"|?*\\r\\n]/g, '_');
-                if (!safePath || safePath === '/') safePath = '/index';
-                if (safePath.startsWith('/')) safePath = safePath.slice(1);
-                linkMap[url] = './resources/' + safePath;
-              } catch (e) {}
-            });
-
-            // Rewrite HTML references to local resources (simple regex)
-            let rewrittenHtml = html;
-            // Replace src/href attributes that match collected URLs
-            Object.entries(linkMap).forEach(([origUrl, localPath]) => {
-              // Escape for regex
-              const escaped = origUrl.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-              rewrittenHtml = rewrittenHtml.replace(new RegExp(escaped, 'g'), localPath);
-            });
-            fs.writeFileSync(path.join(BASE_PATH, 'index.html'), rewrittenHtml);
-
-            await browser.close();
-
-            // Create ZIP archive
-            const outputZip = path.join(BASE_PATH + '.zip');
-            const output = fs.createWriteStream(outputZip);
-            const archive = archiver('zip', { zlib: { level: 9 } });
-            archive.pipe(output);
-            archive.directory(BASE_PATH, DIR_NAME);
-            await archive.finalize();
-
-            // Set environment variables for next steps
-            console.log('DIR_NAME=' + DIR_NAME);
-            console.log('ZIP_PATH=' + outputZip);
-            console.log('MAIN_HTML=fetched_pages/' + DIR_NAME + '/index.html');
           })();
           " 2>&1 | tee script-output.log
-          # Extract variables from the script's console output
+
+      - name: Export environment variables
+        run: |
           DIR_NAME=$(grep 'DIR_NAME=' script-output.log | head -1 | cut -d '=' -f2)
           ZIP_PATH=$(grep 'ZIP_PATH=' script-output.log | head -1 | cut -d '=' -f2)
           echo "DIR_NAME=$DIR_NAME" >> $GITHUB_ENV
           echo "ZIP_PATH=$ZIP_PATH" >> $GITHUB_ENV
+          echo "DIR_NAME=$DIR_NAME"
 
-      - name: Create metadata
+      - name: Create metadata (always)
+        if: always()
         run: |
+          mkdir -p fetched_pages/$DIR_NAME || true
           cat > metadata.json <<EOF
           {
             "original_url": "${{ github.event.inputs.url }}",
-            "saved_zip": "$ZIP_PATH",
+            "saved_zip": "${{ env.ZIP_PATH }}",
+            "directory": "fetched_pages/${{ env.DIR_NAME }}",
             "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           }
           EOF
 
-      - name: Commit and push changes (ZIP + metadata)
+      - name: Commit and push (folder + metadata)
+        if: always()
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add fetched_pages/ metadata.json
-          git diff --staged --quiet || git commit -m "Add fully fetched page as ZIP from ${{ github.event.inputs.url }}"
+          git diff --staged --quiet || git commit -m "Add fetched page from ${{ github.event.inputs.url }}"
           git push
 
-      - name: Upload ZIP artifact
+      - name: Upload artifact (ZIP if available, otherwise directory)
+        if: always() && env.DIR_NAME != ''
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.DIR_NAME }}
-          path: ${{ env.ZIP_PATH }}
+          path: ${{ env.ZIP_PATH != '' && env.ZIP_PATH || format('fetched_pages/{0}', env.DIR_NAME) }}
