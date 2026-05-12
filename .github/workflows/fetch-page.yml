@@ -1,10 +1,10 @@
-name: Fetch Page & Save to Repo
+name: Fetch Full Page & Save to Repo
 
 on:
   workflow_dispatch:
     inputs:
       url:
-        description: 'URL to fetch'
+        description: 'URL to fetch (full page with all assets)'
         required: true
         type: string
 
@@ -12,35 +12,70 @@ jobs:
   fetch-and-save:
     runs-on: ubuntu-latest
     permissions:
-      contents: write   # اجازه commit به ریپازیتوری
+      contents: write
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}  # توکن پیش‌فرض (دسترسی write دارد اگر permissions داده شود)
+          token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Fetch page with curl
+      - name: Prepare directory and fetch page with wget
         run: |
           URL="${{ github.event.inputs.url }}"
           TIMESTAMP=$(date -u +%Y%m%d_%H%M%S)
-          # ساخت نام فایل منحصربفرد از URL + timestamp
           SAFE_NAME=$(echo "$URL" | sha256sum | cut -c1-12)
-          FILENAME="fetched_${TIMESTAMP}_${SAFE_NAME}.html"
-          mkdir -p fetched_pages
-          curl -L -k -A "Mozilla/5.0" -o "fetched_pages/$FILENAME" --max-time 60 "$URL" || echo "<html><body><h1>Error fetching</h1></body></html>" > "fetched_pages/$FILENAME"
-          echo "FILE_NAME=$FILENAME" >> $GITHUB_ENV
-          echo "FILE_PATH=fetched_pages/$FILENAME" >> $GITHUB_ENV
+          DIR_NAME="fetched_${TIMESTAMP}_${SAFE_NAME}"
+          BASE_PATH="fetched_pages/$DIR_NAME"
 
-      - name: Create link file (for Tkinter)
+          mkdir -p "$BASE_PATH"
+
+          # دانلود کامل صفحه با منابع
+          wget \
+            --recursive \
+            --level=1 \
+            --page-requisites \
+            --adjust-extension \
+            --convert-links \
+            --no-parent \
+            --no-host-directories \
+            --no-check-certificate \
+            --timeout=30 \
+            --tries=2 \
+            --user-agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
+            --restrict-file-names=nocontrol \
+            --directory-prefix="$BASE_PATH" \
+            -e robots=off \
+            "$URL"
+
+          # پیدا کردن فایل HTML اصلی (معمولاً index.html یا همان نام فایل)
+          MAIN_HTML=$(find "$BASE_PATH" -maxdepth 1 -name '*.html' -type f | head -1)
+          if [ -z "$MAIN_HTML" ]; then
+            # اگر با no-host-directories پیداش نشد، شاید داخل یک زیرپوشه باشد (اگر حذفش کنیم)
+            MAIN_HTML=$(find "$BASE_PATH" -name '*.html' -type f | head -1)
+          fi
+
+          if [ -z "$MAIN_HTML" ]; then
+            echo "Error: No HTML file found after download."
+            exit 1
+          fi
+
+          MAIN_REL_PATH=$(realpath --relative-to="$PWD" "$MAIN_HTML")
+
+          # متغیرهای محیطی برای مراحل بعد
+          echo "DIR_NAME=$DIR_NAME" >> $GITHUB_ENV
+          echo "MAIN_REL_PATH=$MAIN_REL_PATH" >> $GITHUB_ENV
+          echo "BASE_PATH=$BASE_PATH" >> $GITHUB_ENV
+
+      - name: Create metadata and link files
         run: |
-          # لینک نسخه raw (برای دانلود مستقیم)
-          RAW_URL="https://raw.githubusercontent.com/${{ github.repository }}/main/${FILE_PATH}"
+          RAW_URL="https://raw.githubusercontent.com/${{ github.repository }}/main/$MAIN_REL_PATH"
+          
           echo "$RAW_URL" > link.txt
-          # همچنین متادیتا ذخیره کن
           cat > metadata.json <<EOF
           {
             "original_url": "${{ github.event.inputs.url }}",
-            "saved_file": "$FILE_PATH",
+            "saved_directory": "$BASE_PATH",
+            "main_file": "$MAIN_REL_PATH",
             "raw_link": "$RAW_URL",
             "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           }
@@ -51,14 +86,11 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add fetched_pages/ link.txt metadata.json
-          git diff --staged --quiet || git commit -m "Add fetched page from ${{ github.event.inputs.url }}"
+          git diff --staged --quiet || git commit -m "Add fully fetched page from ${{ github.event.inputs.url }}"
           git push
 
-      - name: Upload artifacts (for Tkinter app)
+      - name: Upload artifact (full directory)
         uses: actions/upload-artifact@v4
         with:
-          name: fetched_page
-          path: |
-            fetched_pages/*.html
-            link.txt
-            metadata.json
+          name: ${{ env.DIR_NAME }}
+          path: ${{ env.BASE_PATH }}/
