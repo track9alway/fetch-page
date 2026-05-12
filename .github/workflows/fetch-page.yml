@@ -1,10 +1,9 @@
-name: Fetch Web Page via GitHub
-
+name: Fetch Page
 on:
   workflow_dispatch:
     inputs:
       url:
-        description: 'آدرس صفحه مورد نظر (مثلاً https://example.com)'
+        description: 'URL to fetch'
         required: true
         type: string
 
@@ -12,16 +11,11 @@ jobs:
   fetch:
     runs-on: ubuntu-latest
     steps:
-      - name: آماده‌سازی پوشه
-        run: mkdir -p fetched_content
-
-      - name: دانلود صفحه با curl
+      - name: Fetch URL
         run: |
-          curl -L -o fetched_content/page.html "${{ github.event.inputs.url }}"
-          curl -L -I "${{ github.event.inputs.url }}" > fetched_content/headers.txt
-
-      - name: آپلود آرتیفکت
+          curl -L -o page.html "${{ github.event.inputs.url }}"
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: fetched_page
-          path: fetched_content/
+          path: page.html
