@@ -1,10 +1,10 @@
-name: Fetch Full Page & Index
+name: Fetch Full Page & Save to Repo (ZIP)
 
 on:
   workflow_dispatch:
     inputs:
       url:
-        description: 'URL to fetch'
+        description: 'URL to fetch (full page with all assets)'
         required: true
         type: string
 
@@ -19,76 +19,141 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Prepare directory and fetch page with wget
-        id: fetcher
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install system dependencies for Playwright
         run: |
-          URL="${{ github.event.inputs.url }}"
-          TIMESTAMP=$(date -u +%Y%m%d_%H%M%S)
-          SAFE_NAME=$(echo "$URL" | sha256sum | cut -c1-12)
-          DIR_NAME="fetched_${TIMESTAMP}_${SAFE_NAME}"
-          BASE_PATH="fetched_pages/$DIR_NAME"
+          npx playwright install-deps chromium
+          npx playwright install chromium
 
-          mkdir -p "$BASE_PATH"
-
-          # دانلود کامل صفحه با منابع
-          wget \
-            --recursive \
-            --level=1 \
-            --page-requisites \
-            --adjust-extension \
-            --convert-links \
-            --no-parent \
-            --no-host-directories \
-            --no-check-certificate \
-            --timeout=30 \
-            --tries=2 \
-            --user-agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
-            --restrict-file-names=nocontrol \
-            --directory-prefix="$BASE_PATH" \
-            -e robots=off \
-            "$URL"
-
-          # پیدا کردن فایل HTML اصلی
-          MAIN_HTML=$(find "$BASE_PATH" -maxdepth 1 -name '*.html' -type f | head -1)
-          if [ -z "$MAIN_HTML" ]; then
-            MAIN_HTML=$(find "$BASE_PATH" -name '*.html' -type f | head -1)
-          fi
-          if [ -z "$MAIN_HTML" ]; then
-            echo "Error: No HTML found"
-            exit 1
-          fi
-
-          MAIN_REL_PATH=$(realpath --relative-to="$PWD" "$MAIN_HTML")
-          RAW_URL="https://raw.githubusercontent.com/${{ github.repository }}/main/$MAIN_REL_PATH"
-
-          echo "main_file=$MAIN_REL_PATH" >> $GITHUB_OUTPUT
-          echo "raw_url=$RAW_URL" >> $GITHUB_OUTPUT
-          echo "dir_name=$DIR_NAME" >> $GITHUB_OUTPUT
-          echo "timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> $GITHUB_OUTPUT
-
-      - name: Update index.json
+      - name: Fetch full page with Playwright (stealth + resource saving)
         run: |
-          # اگر index.json وجود نداشت، یک آرایه‌ی جدید بساز
-          if [ ! -f index.json ]; then
-            echo '[]' > index.json
-          fi
+          npm install playwright playwright-extra puppeteer-extra-plugin-stealth archiver
+          node -e "
+          const { chromium } = require('playwright-extra');
+          const stealth = require('puppeteer-extra-plugin-stealth')();
+          chromium.use(stealth);
+          const fs = require('fs');
+          const path = require('path');
+          const archiver = require('archiver');
 
-          NEW_ENTRY=$(jq -n --arg url "${{ github.event.inputs.url }}" \
-                            --arg main_file "${{ steps.fetcher.outputs.main_file }}" \
-                            --arg raw_url "${{ steps.fetcher.outputs.raw_url }}" \
-                            --arg dir_name "${{ steps.fetcher.outputs.dir_name }}" \
-                            --arg ts "${{ steps.fetcher.outputs.timestamp }}" \
-            '{original_url: $url, main_file: $main_file, raw_url: $raw_url, dir: $dir_name, timestamp: $ts}')
+          const URL = process.env.INPUT_URL;
+          const TIMESTAMP = new Date().toISOString().replace(/[:.]/g, '-');
+          const DIR_NAME = 'fetched_' + TIMESTAMP;
+          const BASE_PATH = path.join('fetched_pages', DIR_NAME);
 
-          # به‌روزرسانی فایل: حذف ورودی قدیمی با همان original_url (اگر بود) و افزودن جدید
-          UPDATED=$(jq --argjson entry "$NEW_ENTRY" --arg url "${{ github.event.inputs.url }}" \
-            'map(select(.original_url != $url)) + [$entry]' index.json)
-          echo "$UPDATED" > index.json
+          fs.mkdirSync(BASE_PATH, { recursive: true });
 
-      - name: Commit and push
+          (async () => {
+            const browser = await chromium.launch({ headless: true });
+            const context = await browser.newContext({
+              userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
+            });
+            const page = await context.newPage();
+
+            // Collect all responses to save assets
+            const assets = new Map();
+            page.on('response', async response => {
+              try {
+                const url = response.url();
+                const buffer = await response.body();
+                assets.set(url, buffer);
+              } catch (e) {}
+            });
+
+            await page.goto(URL, { waitUntil: 'networkidle', timeout: 60000 });
+
+            // Get final HTML after all JS
+            const html = await page.content();
+            fs.writeFileSync(path.join(BASE_PATH, 'index.html'), html);
+
+            // Save collected assets with safe filenames
+            const resourceDir = path.join(BASE_PATH, 'resources');
+            fs.mkdirSync(resourceDir, { recursive: true });
+
+            for (const [url, buffer] of assets) {
+              try {
+                const parsed = new URL(url);
+                // Sanitise path: replace invalid characters with '_'
+                let safePath = parsed.pathname.replace(/[<>:\"|?*\\r\\n]/g, '_');
+                if (!safePath || safePath === '/') safePath = '/index';
+                // Remove leading slash for relative saving
+                if (safePath.startsWith('/')) safePath = safePath.slice(1);
+                // Preserve extension from query if any? We'll just keep original path
+                const fullPath = path.join(resourceDir, safePath);
+                fs.mkdirSync(path.dirname(fullPath), { recursive: true });
+                fs.writeFileSync(fullPath, buffer);
+              } catch (e) {}
+            }
+
+            // Create a mapping from original URL to local relative path
+            // (used to rewrite HTML)
+            const linkMap = {};
+            assets.forEach((_, url) => {
+              try {
+                const parsed = new URL(url);
+                let safePath = parsed.pathname.replace(/[<>:\"|?*\\r\\n]/g, '_');
+                if (!safePath || safePath === '/') safePath = '/index';
+                if (safePath.startsWith('/')) safePath = safePath.slice(1);
+                linkMap[url] = './resources/' + safePath;
+              } catch (e) {}
+            });
+
+            // Rewrite HTML references to local resources (simple regex)
+            let rewrittenHtml = html;
+            // Replace src/href attributes that match collected URLs
+            Object.entries(linkMap).forEach(([origUrl, localPath]) => {
+              // Escape for regex
+              const escaped = origUrl.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+              rewrittenHtml = rewrittenHtml.replace(new RegExp(escaped, 'g'), localPath);
+            });
+            fs.writeFileSync(path.join(BASE_PATH, 'index.html'), rewrittenHtml);
+
+            await browser.close();
+
+            // Create ZIP archive
+            const outputZip = path.join(BASE_PATH + '.zip');
+            const output = fs.createWriteStream(outputZip);
+            const archive = archiver('zip', { zlib: { level: 9 } });
+            archive.pipe(output);
+            archive.directory(BASE_PATH, DIR_NAME);
+            await archive.finalize();
+
+            // Set environment variables for next steps
+            console.log('DIR_NAME=' + DIR_NAME);
+            console.log('ZIP_PATH=' + outputZip);
+            console.log('MAIN_HTML=fetched_pages/' + DIR_NAME + '/index.html');
+          })();
+          " 2>&1 | tee script-output.log
+          # Extract variables from the script's console output
+          DIR_NAME=$(grep 'DIR_NAME=' script-output.log | head -1 | cut -d '=' -f2)
+          ZIP_PATH=$(grep 'ZIP_PATH=' script-output.log | head -1 | cut -d '=' -f2)
+          echo "DIR_NAME=$DIR_NAME" >> $GITHUB_ENV
+          echo "ZIP_PATH=$ZIP_PATH" >> $GITHUB_ENV
+
+      - name: Create metadata
+        run: |
+          cat > metadata.json <<EOF
+          {
+            "original_url": "${{ github.event.inputs.url }}",
+            "saved_zip": "$ZIP_PATH",
+            "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          }
+          EOF
+
+      - name: Commit and push changes (ZIP + metadata)
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add fetched_pages/ index.json
-          git diff --staged --quiet || git commit -m "Save page: ${{ github.event.inputs.url }}"
+          git add fetched_pages/ metadata.json
+          git diff --staged --quiet || git commit -m "Add fully fetched page as ZIP from ${{ github.event.inputs.url }}"
           git push
+
+      - name: Upload ZIP artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.DIR_NAME }}
+          path: ${{ env.ZIP_PATH }}
