@@ -42,7 +42,7 @@ jobs:
         id: fetch
         run: |
           npm install playwright playwright-extra puppeteer-extra-plugin-stealth cheerio archiver
-          node << 'NODESCRIPT'
+          node --input-type=commonjs << 'NODESCRIPT'
           const fs = require('fs');
           const path = require('path');
           const archiver = require('archiver');
