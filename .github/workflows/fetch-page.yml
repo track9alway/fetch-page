@@ -1,61 +1,64 @@
-name: Fetch Page Advanced (curl)
+name: Fetch Page & Save to Repo
 
 on:
   workflow_dispatch:
     inputs:
       url:
-        description: 'URL to fetch (single URL)'
+        description: 'URL to fetch'
         required: true
-        type: string
-      user_agent:
-        description: 'Custom User-Agent (optional)'
-        required: false
-        default: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
         type: string
 
 jobs:
-  fetch:
+  fetch-and-save:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write   # اجازه commit به ریپازیتوری
     steps:
-      - name: Fetch URL with curl
-        run: |
-          set -e
-          URL="${{ github.event.inputs.url }}"
-          UA="${{ github.event.inputs.user_agent }}"
-          
-          # دریافت صفحه و ذخیره محتوا + هدرها
-          curl -L -k -A "$UA" \
-               -w "%{http_code}" \
-               -o page.html \
-               -D headers.txt \
-               --max-time 60 \
-               "$URL" > status_code.txt || true
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}  # توکن پیش‌فرض (دسترسی write دارد اگر permissions داده شود)
 
-          # ذخیره URL نهایی بعد از ریدایرکت‌ها
-          echo -n "$(curl -Ls -o /dev/null -w '%{url_effective}' "$URL")" > final_url.txt
-          
-          # ایجاد فایل متادیتا
+      - name: Fetch page with curl
+        run: |
+          URL="${{ github.event.inputs.url }}"
+          TIMESTAMP=$(date -u +%Y%m%d_%H%M%S)
+          # ساخت نام فایل منحصربفرد از URL + timestamp
+          SAFE_NAME=$(echo "$URL" | sha256sum | cut -c1-12)
+          FILENAME="fetched_${TIMESTAMP}_${SAFE_NAME}.html"
+          mkdir -p fetched_pages
+          curl -L -k -A "Mozilla/5.0" -o "fetched_pages/$FILENAME" --max-time 60 "$URL" || echo "<html><body><h1>Error fetching</h1></body></html>" > "fetched_pages/$FILENAME"
+          echo "FILE_NAME=$FILENAME" >> $GITHUB_ENV
+          echo "FILE_PATH=fetched_pages/$FILENAME" >> $GITHUB_ENV
+
+      - name: Create link file (for Tkinter)
+        run: |
+          # لینک نسخه raw (برای دانلود مستقیم)
+          RAW_URL="https://raw.githubusercontent.com/${{ github.repository }}/main/${FILE_PATH}"
+          echo "$RAW_URL" > link.txt
+          # همچنین متادیتا ذخیره کن
           cat > metadata.json <<EOF
           {
-            "original_url": "$URL",
-            "final_url": "$(cat final_url.txt)",
-            "http_status": $(cat status_code.txt | tr -d '\n'),
-            "user_agent": "$UA",
+            "original_url": "${{ github.event.inputs.url }}",
+            "saved_file": "$FILE_PATH",
+            "raw_link": "$RAW_URL",
             "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           }
           EOF
-          
-          # اگر صفحه خالی است یا خطا رخ داده، لاگ خطا را ذخیره کن
-          if [ ! -s page.html ]; then
-            echo "Failed to fetch content" > error.log
-          fi
 
-      - name: Upload artifacts
+      - name: Commit and push changes
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add fetched_pages/ link.txt metadata.json
+          git diff --staged --quiet || git commit -m "Add fetched page from ${{ github.event.inputs.url }}"
+          git push
+
+      - name: Upload artifacts (for Tkinter app)
         uses: actions/upload-artifact@v4
         with:
           name: fetched_page
           path: |
-            page.html
+            fetched_pages/*.html
+            link.txt
             metadata.json
-            error.log
-          if-no-files-found: warn
