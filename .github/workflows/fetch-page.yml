@@ -1,198 +1,133 @@
-name: Capture Full Page with Assets
+name: Fetch Full Page & Save to Repo (ZIP)
 
 on:
   workflow_dispatch:
     inputs:
       url:
-        description: 'URL to capture (full page + assets)'
+        description: 'URL to fetch (full page with all assets)'
         required: true
         type: string
       wait_until:
-        description: 'Playwright wait condition (networkidle, load, domcontentloaded)'
+        description: 'Playwright waitUntil condition (default: networkidle)'
         required: false
         default: 'networkidle'
         type: string
-      extra_wait_seconds:
-        description: 'Extra seconds to wait after page load (e.g., for lazy content)'
+      extra_wait:
+        description: 'Extra seconds to wait after page load (for dynamic content)'
         required: false
         default: '2'
         type: string
-      max_asset_size_mb:
-        description: 'Maximum size (MB) per asset to store (larger assets skipped)'
-        required: false
-        default: '10'
-        type: string
-
-# جلوگیری از هم‌پوشانی commit در شاخه‌ی یکسان
-concurrency:
-  group: fetch-page-${{ github.ref }}
-  cancel-in-progress: false
 
 jobs:
-  capture:
+  fetch-and-save:
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
-      - name: Checkout repository
+      - name: Checkout repo
         uses: actions/checkout@v4
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          fetch-depth: 1
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: '20'
-          cache: 'npm'
 
-      - name: Cache Playwright browsers
-        id: playwright-cache
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/ms-playwright
-          key: ${{ runner.os }}-playwright-${{ hashFiles('**/package-lock.json') }}
-          restore-keys: |
-            ${{ runner.os }}-playwright-
-
-      - name: Install dependencies
+      - name: Install system dependencies for Playwright
         run: |
-          npm install playwright playwright-extra puppeteer-extra-plugin-stealth cheerio archiver
           npx playwright install-deps chromium
           npx playwright install chromium
 
-      - name: Create capture script
+      - name: Fetch & save page (resilient)
+        id: fetch
         run: |
-          cat > capture.js << 'EOF'
+          npm install playwright playwright-extra puppeteer-extra-plugin-stealth cheerio archiver
+          node -e "
           const fs = require('fs');
           const path = require('path');
-          const { chromium } = require('playwright-extra');
-          const stealth = require('puppeteer-extra-plugin-stealth')();
           const archiver = require('archiver');
           const cheerio = require('cheerio');
-
+          const { chromium } = require('playwright-extra');
+          const stealth = require('puppeteer-extra-plugin-stealth')();
           chromium.use(stealth);
 
-          (async () => {
-            const url = process.env.INPUT_URL;
-            if (!url) throw new Error('INPUT_URL is required');
+          const URL = process.env.INPUT_URL;
+          const WAIT_UNTIL = process.env.INPUT_WAIT_UNTIL || 'networkidle';
+          const EXTRA_WAIT = parseInt(process.env.INPUT_EXTRA_WAIT || '2', 10);
+          const TIMESTAMP = new Date().toISOString().replace(/[:.]/g, '-');
+          const DIR_NAME = 'fetched_' + TIMESTAMP;
+          const BASE_DIR = path.join('fetched_pages', DIR_NAME);
 
-            const waitUntil = process.env.INPUT_WAIT_UNTIL || 'networkidle';
-            const extraWait = parseInt(process.env.INPUT_EXTRA_WAIT_SECONDS || '2', 10);
-            const maxAssetSizeBytes = parseInt(process.env.INPUT_MAX_ASSET_SIZE_MB || '10', 10) * 1024 * 1024;
+          // ------------------------------------------------------------------
+          // 1. همیشه دایرکتوری اصلی و زیرپوشه را بساز (حتی اگر خطا رخ دهد)
+          // ------------------------------------------------------------------
+          fs.mkdirSync(BASE_DIR, { recursive: true });
 
-            const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-            let domain;
-            try {
-              domain = new URL(url).hostname.replace(/^www\./, '');
-            } catch {
-              domain = 'unknown';
-            }
-            const dirName = `${timestamp}_${domain}`;
-            const baseDir = path.join('fetched_pages', dirName);
-            const resourcesDir = path.join(baseDir, 'resources');
-            fs.mkdirSync(resourcesDir, { recursive: true });
+          let finalHtml = '<html><body><h1>Page fetch failed</h1><p>See logs for details.</p></body></html>';
+          let assetBuffers = new Map();
+          const metadata = {
+            original_url: URL,
+            timestamp: new Date().toISOString(),
+            status: 'failed'
+          };
 
-            const metadata = {
-              original_url: url,
-              timestamp: new Date().toISOString(),
-              wait_condition: waitUntil,
-              extra_wait_seconds: extraWait,
-              status: 'pending',
-              assets_saved: 0,
-              assets_failed: 0,
-              total_size_bytes: 0,
-            };
+          try {
+            const browser = await chromium.launch({ headless: true });
+            const context = await browser.newContext({
+              userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            });
+            const page = await context.newPage();
 
-            let finalHtml = '<html><body><h1>Failed to capture page</h1><p>See logs for details.</p></body></html>';
-            const assetBuffers = new Map(); // url -> {buffer, type}
-
-            try {
-              const browser = await chromium.launch({ headless: true });
-              const context = await browser.newContext({
-                userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                viewport: { width: 1280, height: 720 },
-                javaScriptEnabled: true,
-              });
-              const page = await context.newPage();
-
-              // جمع‌آوری تمام پاسخ‌ها (assets)
-              page.on('response', async response => {
-                try {
-                  const responseUrl = response.url();
-                  // محدودیت دامنه؟ می‌توان همه را ذخیره کرد، اما برای کاهش حجم می‌توان فیلتر کرد
-                  if (responseUrl.startsWith('data:')) return;
-                  const buffer = await response.body().catch(() => null);
-                  if (buffer && buffer.length <= maxAssetSizeBytes) {
-                    assetBuffers.set(responseUrl, buffer);
-                  } else if (buffer && buffer.length > maxAssetSizeBytes) {
-                    console.log(`Skipping ${responseUrl} (size ${buffer.length} bytes > limit)`);
-                  }
-                } catch (err) {
-                  // خطای ذخیره‌سازی یک دارایی را نادیده بگیر
-                }
-              });
-
-              // بارگذاری صفحه اصلی
+            page.on('response', async response => {
               try {
-                await page.goto(url, { waitUntil, timeout: 90000 });
-                if (extraWait > 0) await new Promise(resolve => setTimeout(resolve, extraWait * 1000));
-                finalHtml = await page.content();
-                metadata.status = 'success';
-              } catch (gotoErr) {
-                metadata.status = 'partial';
-                metadata.error = gotoErr.message;
-                finalHtml = await page.content().catch(() => finalHtml);
-              }
+                const buffer = await response.body();
+                assetBuffers.set(response.url(), buffer);
+              } catch (_) {}
+            });
 
-              // ذخیره اسکرین‌شات
-              const screenshotPath = path.join(baseDir, 'screenshot.png');
-              await page.screenshot({ path: screenshotPath, fullPage: true }).catch(() => {});
-
-              await browser.close();
-            } catch (err) {
-              metadata.status = 'failed';
-              metadata.error = err.message;
+            try {
+              await page.goto(URL, { waitUntil: WAIT_UNTIL, timeout: 90000 });
+              if (EXTRA_WAIT > 0) await page.waitForTimeout(EXTRA_WAIT * 1000);
+              finalHtml = await page.content();
+              metadata.status = 'success';
+            } catch (gotoErr) {
+              metadata.error = gotoErr.message;
+              try { finalHtml = await page.content(); } catch (_) {}
             }
+            await browser.close();
+          } catch (launchErr) {
+            metadata.error = 'Browser launch failed: ' + launchErr.message;
+          }
 
-            // همیشه index.html را بنویس (حتی اگر محتوای خطا باشد)
-            fs.writeFileSync(path.join(baseDir, 'index.html'), finalHtml);
+          // ------------------------------------------------------------------
+          // 2. همیشه index.html را بنویس (حتماً وجود دارد)
+          // ------------------------------------------------------------------
+          const indexPath = path.join(BASE_DIR, 'index.html');
+          fs.writeFileSync(indexPath, finalHtml);
 
-            // ذخیره assets در دیسک و بازنویسی لینک‌های HTML
+          // ------------------------------------------------------------------
+          // 3. اگر asset وجود داشت، آن‌ها را ذخیره و آدرس‌ها را بازنویسی کن
+          // ------------------------------------------------------------------
+          if (assetBuffers.size > 0) {
+            const resourceDir = path.join(BASE_DIR, 'resources');
+            fs.mkdirSync(resourceDir, { recursive: true });
             const linkMap = new Map();
-            let savedCount = 0;
-            let failedCount = 0;
-            let totalSize = 0;
 
-            for (const [assetUrl, buffer] of assetBuffers) {
+            for (const [url, buffer] of assetBuffers) {
               try {
-                const parsed = new URL(assetUrl);
-                let filePath = parsed.pathname;
-                if (!filePath || filePath === '/') filePath = '/index.html';
-                // تمیز کردن نام فایل
-                let safeName = filePath.replace(/[<>:"|?*\\]/g, '_');
+                const parsed = new URL(url);
+                let safeName = parsed.pathname.replace(/[<>:\"|?*\\\n\r]/g, '_');
+                if (!safeName || safeName === '/') safeName = 'index';
+                if (parsed.search) safeName += parsed.search.replace(/[<>:\"|?*\\\n\r]/g, '_');
                 if (safeName.startsWith('/')) safeName = safeName.slice(1);
-                if (parsed.search) {
-                  safeName += '_' + parsed.search.replace(/[<>:"|?*\\]/g, '_');
-                }
-                const fullOutPath = path.join(resourcesDir, safeName);
-                fs.mkdirSync(path.dirname(fullOutPath), { recursive: true });
-                fs.writeFileSync(fullOutPath, buffer);
-                const relativePath = './resources/' + safeName.replace(/\\/g, '/');
-                linkMap.set(assetUrl, relativePath);
-                savedCount++;
-                totalSize += buffer.length;
-              } catch (err) {
-                failedCount++;
-                console.warn(`Failed to save asset ${assetUrl}:`, err.message);
-              }
+                const outPath = path.join(resourceDir, safeName);
+                fs.mkdirSync(path.dirname(outPath), { recursive: true });
+                fs.writeFileSync(outPath, buffer);
+                linkMap.set(url, './resources/' + safeName.replace(/\\/g, '/'));
+              } catch (_) {}
             }
 
-            metadata.assets_saved = savedCount;
-            metadata.assets_failed = failedCount;
-            metadata.total_size_bytes = totalSize;
-
-            // بازنویسی فایل HTML با لینک‌های محلی
             if (linkMap.size > 0) {
               const $ = cheerio.load(finalHtml);
               $('[src]').each((i, el) => {
@@ -206,98 +141,91 @@ jobs:
               $('[srcset]').each((i, el) => {
                 const srcset = $(el).attr('srcset');
                 if (srcset) {
-                  const parts = srcset.split(',').map(part => {
-                    const [u, ...rest] = part.trim().split(/\s+/);
-                    if (u && linkMap.has(u)) return linkMap.get(u) + (rest.length ? ' ' + rest.join(' ') : '');
-                    return part.trim();
+                  const parts = srcset.split(',').map(p => {
+                    const [u, ...r] = p.trim().split(/\s+/);
+                    if (u && linkMap.has(u)) return linkMap.get(u) + (r.length ? ' ' + r.join(' ') : '');
+                    return p.trim();
                   });
                   $(el).attr('srcset', parts.join(', '));
                 }
               });
-              const updatedHtml = $.html();
-              fs.writeFileSync(path.join(baseDir, 'index.html'), updatedHtml);
+              const newHtml = $.html();
+              fs.writeFileSync(indexPath, newHtml);
             }
+          }
 
-            // نوشتن metadata.json در پوشه
-            fs.writeFileSync(path.join(baseDir, 'metadata.json'), JSON.stringify(metadata, null, 2));
+          // ------------------------------------------------------------------
+          // 4. متادیتا را داخل پوشه بنویس
+          // ------------------------------------------------------------------
+          fs.writeFileSync(path.join(BASE_DIR, 'metadata.json'), JSON.stringify(metadata, null, 2));
 
-            // ساخت فایل ZIP
-            let zipPath = '';
-            try {
-              const outputZip = `${baseDir}.zip`;
-              const output = fs.createWriteStream(outputZip);
-              const archive = archiver('zip', { zlib: { level: 9 } });
-              await new Promise((resolve, reject) => {
-                output.on('close', resolve);
-                archive.on('error', reject);
-                archive.pipe(output);
-                archive.directory(baseDir, dirName);
-                archive.finalize();
-              });
-              zipPath = outputZip;
-              console.log(`ZIP created: ${zipPath}`);
-              // حذف پوشه اصلی برای کاهش مصرف فضای کاری (اختیاری)
-              // fs.rmSync(baseDir, { recursive: true, force: true });
-            } catch (zipErr) {
-              console.warn('Failed to create ZIP:', zipErr.message);
-            }
+          // ------------------------------------------------------------------
+          // 5. زیپ کردن (در صورت امکان)
+          // ------------------------------------------------------------------
+          let zipPath = '';
+          try {
+            const outputZip = BASE_DIR + '.zip';
+            const output = fs.createWriteStream(outputZip);
+            const archive = archiver('zip', { zlib: { level: 9 } });
+            await new Promise((resolve, reject) => {
+              output.on('close', resolve);
+              archive.on('error', reject);
+              archive.pipe(output);
+              archive.directory(BASE_DIR, DIR_NAME);
+              archive.finalize();
+            });
+            zipPath = outputZip;
+            console.log('ZIP_PATH=' + zipPath);
+          } catch (e) {
+            console.warn('Zip failed: ' + e.message);
+          }
 
-            // خروجی برای مراحل بعدی
-            const outputs = {
-              dir_name: dirName,
-              zip_path: zipPath,
-              status: metadata.status,
-              assets_saved: String(savedCount),
-            };
-            const githubOutput = process.env.GITHUB_OUTPUT;
-            if (githubOutput) {
-              for (const [key, value] of Object.entries(outputs)) {
-                fs.appendFileSync(githubOutput, `${key}=${value}\n`);
-              }
-            } else {
-              console.log('::set-output name=dir_name::' + dirName);
-              console.log('::set-output name=zip_path::' + zipPath);
-            }
-            // همچنین در خروجی استاندارد برای grep احتمالی
-            console.log(`DIR_NAME=${dirName}`);
-            console.log(`ZIP_PATH=${zipPath}`);
-          })();
-          EOF
-
-      - name: Run capture script
-        id: capture
+          // ------------------------------------------------------------------
+          // 6. خروجی برای مراحل بعد (ذخیره در فایل)
+          // ------------------------------------------------------------------
+          console.log('DIR_NAME=' + DIR_NAME);
+          // نوشتن متغیرها در فایل مخصوص انتقال
+          fs.writeFileSync(process.env.GITHUB_OUTPUT, `DIR_NAME=${DIR_NAME}\nZIP_PATH=${zipPath}\n`, { flag: 'a' });
+          " 2>&1
         env:
           INPUT_URL: ${{ github.event.inputs.url }}
           INPUT_WAIT_UNTIL: ${{ github.event.inputs.wait_until }}
-          INPUT_EXTRA_WAIT_SECONDS: ${{ github.event.inputs.extra_wait_seconds }}
-          INPUT_MAX_ASSET_SIZE_MB: ${{ github.event.inputs.max_asset_size_mb }}
-        run: node capture.js
+          INPUT_EXTRA_WAIT: ${{ github.event.inputs.extra_wait }}
 
-      - name: Commit and push captured page
+      - name: Commit and push (folder + repo metadata)
         if: always()
         run: |
-          # ساخت metadata ریشه مخزن (برای ردیابی کلی)
-          cat > root_metadata.json << EOF
+          # اطمینان از وجود دایرکتوری fetched_pages (حتی اگر خالی باشد)
+          mkdir -p fetched_pages
+
+          # ساختن metadata.json در ریشه (اختیاری برای لاگ)
+          cat > metadata.json <<EOF
           {
             "original_url": "${{ github.event.inputs.url }}",
-            "capture_timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
-            "directory": "fetched_pages/${{ steps.capture.outputs.dir_name }}",
-            "zip_file": "${{ steps.capture.outputs.zip_path }}",
-            "status": "${{ steps.capture.outputs.status }}",
-            "assets_saved": ${{ steps.capture.outputs.assets_saved }}
+            "directory": "fetched_pages/${{ steps.fetch.outputs.DIR_NAME }}",
+            "zip": "${{ steps.fetch.outputs.ZIP_PATH }}",
+            "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           }
           EOF
 
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add fetched_pages/ root_metadata.json
-          git diff --staged --quiet || git commit -m "Capture webpage from ${{ github.event.inputs.url }} [skip ci]"
+
+          # اضافه کردن فایل‌ها – اگر fetched_pages خالی نباشد اضافه می‌شود
+          git add metadata.json
+          if [ -d "fetched_pages" ] && [ -n "$(ls -A fetched_pages 2>/dev/null)" ]; then
+            git add fetched_pages/
+          else
+            echo "⚠️ No fetched_pages content to commit"
+          fi
+
+          # Commit فقط در صورت وجود تغییر
+          git diff --staged --quiet || git commit -m "Add page snapshot from ${{ github.event.inputs.url }}"
           git push
 
-      - name: Upload artifact (ZIP or folder)
-        if: always() && steps.capture.outputs.dir_name != ''
+      - name: Upload artifact (ZIP if exists, else folder)
+        if: always() && steps.fetch.outputs.DIR_NAME != ''
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ steps.capture.outputs.dir_name }}
-          path: ${{ steps.capture.outputs.zip_path != '' && steps.capture.outputs.zip_path || format('fetched_pages/{0}', steps.capture.outputs.dir_name) }}
-          retention-days: 30
+          name: ${{ steps.fetch.outputs.DIR_NAME }}
+          path: ${{ steps.fetch.outputs.ZIP_PATH != '' && steps.fetch.outputs.ZIP_PATH || format('fetched_pages/{0}', steps.fetch.outputs.DIR_NAME) }}
