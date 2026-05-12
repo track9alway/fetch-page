@@ -58,129 +58,124 @@ jobs:
           const DIR_NAME = 'fetched_' + TIMESTAMP;
           const BASE_PATH = path.join('fetched_pages', DIR_NAME);
 
+          fs.mkdirSync(BASE_PATH, { recursive: true });
+
+          // ** تضمین وجود حداقل یک فایل **
+          let finalHtml = '<html><body><h1>Page fetch failed</h1><p>See logs for details.</p></body></html>';
+          let assetBuffers = new Map();
+
+          // --- متادیتای خود پوشه (حتماً ساخته شود) ---
+          const metadata = {
+            original_url: URL,
+            timestamp: new Date().toISOString(),
+            status: 'failed'
+          };
+          const writeMetadata = () => {
+            fs.writeFileSync(path.join(BASE_PATH, 'metadata.json'), JSON.stringify(metadata, null, 2));
+          };
+
           try {
-            fs.mkdirSync(BASE_PATH, { recursive: true });
-          } catch (e) {
-            console.error('Could not create base directory:', e.message);
-            process.exit(1);
+            const browser = await chromium.launch({ headless: true });
+            const context = await browser.newContext({
+              userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            });
+            const page = await context.newPage();
+
+            // جمع‌آوری پاسخ‌ها
+            page.on('response', async response => {
+              try {
+                const buffer = await response.body();
+                assetBuffers.set(response.url(), buffer);
+              } catch (_) {}
+            });
+
+            try {
+              await page.goto(URL, { waitUntil: WAIT_UNTIL, timeout: 90000 });
+              if (EXTRA_WAIT > 0) await page.waitForTimeout(EXTRA_WAIT * 1000);
+              finalHtml = await page.content();
+              metadata.status = 'success';
+            } catch (gotoErr) {
+              metadata.error = gotoErr.message;
+              // حتی اگر goto خطا بده، سعی می‌کنیم HTML فعلی را بگیریم
+              try { finalHtml = await page.content(); } catch (_) {}
+            }
+
+            await browser.close();
+          } catch (launchErr) {
+            metadata.error = 'Browser launch failed: ' + launchErr.message;
           }
 
-          (async () => {
-            let browser;
-            try {
-              browser = await chromium.launch({ headless: true });
-              const context = await browser.newContext({
-                userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
-              });
-              const page = await context.newPage();
+          // ** همیشه index.html را بنویس (حتی اگر خالی یا خطا) **
+          fs.writeFileSync(path.join(BASE_PATH, 'index.html'), finalHtml);
 
-              // Collect all responses (including failed ones optionally)
-              const assetBuffers = new Map();
-              page.on('response', async response => {
-                try {
-                  const url = response.url();
-                  const buffer = await response.body();
-                  assetBuffers.set(url, buffer);
-                } catch (e) {
-                  // ignore single asset failures
-                }
-              });
+          // ذخیره‌سازی assetها و بازنویسی (فقط اگر asset داریم)
+          if (assetBuffers.size > 0) {
+            const resourceDir = path.join(BASE_PATH, 'resources');
+            fs.mkdirSync(resourceDir, { recursive: true });
+            const linkMap = new Map();
 
-              // Also intercept requests to ensure we capture all (even blocked ones) – but we only use response for buffer
-              await page.goto(URL, { waitUntil: WAIT_UNTIL, timeout: 90000 });
-              if (EXTRA_WAIT > 0) {
-                await page.waitForTimeout(EXTRA_WAIT * 1000);
-              }
+            for (const [url, buffer] of assetBuffers) {
+              try {
+                const parsed = new URL(url);
+                let safeName = parsed.pathname.replace(/[<>:\"|?*\\r\\n]/g, '_');
+                if (!safeName || safeName === '/') safeName = '/index';
+                if (parsed.search) safeName += parsed.search.replace(/[<>:\"|?*\\r\\n]/g, '_');
+                if (safeName.startsWith('/')) safeName = safeName.slice(1);
+                const outPath = path.join(resourceDir, safeName);
+                fs.mkdirSync(path.dirname(outPath), { recursive: true });
+                fs.writeFileSync(outPath, buffer);
+                linkMap.set(url, './resources/' + safeName.replace(/\\/g, '/'));
+              } catch (_) {}
+            }
 
-              // Get final HTML
-              const html = await page.content();
-
-              // Save assets to resources folder with safe names
-              const resourceDir = path.join(BASE_PATH, 'resources');
-              fs.mkdirSync(resourceDir, { recursive: true });
-              const linkMap = new Map(); // original URL → local relative path
-
-              for (const [url, buffer] of assetBuffers) {
-                try {
-                  const parsed = new URL(url);
-                  let safeName = parsed.pathname.replace(/[<>:\"|?*\\r\\n]/g, '_');
-                  if (!safeName || safeName === '/') safeName = '/index';
-                  // preserve query string as part of filename (to differentiate e.g. ?v=1)
-                  if (parsed.search) {
-                    safeName += parsed.search.replace(/[<>:\"|?*\\r\\n]/g, '_');
-                  }
-                  // remove leading slash for relative path
-                  if (safeName.startsWith('/')) safeName = safeName.slice(1);
-                  const outPath = path.join(resourceDir, safeName);
-                  fs.mkdirSync(path.dirname(outPath), { recursive: true });
-                  fs.writeFileSync(outPath, buffer);
-                  linkMap.set(url, './resources/' + safeName.replace(/\\/g, '/'));
-                } catch (e) {
-                  // Skip asset that can't be saved
-                }
-              }
-
-              // Rewrite HTML using Cheerio for robust replacement
-              const $ = cheerio.load(html);
-              // Elements with src/href/srcset
+            // بازنویسی HTML با Cheerio
+            if (linkMap.size > 0) {
+              const $ = cheerio.load(finalHtml);
               $('[src]').each((i, el) => {
                 const src = $(el).attr('src');
-                if (src && linkMap.has(src)) {
-                  $(el).attr('src', linkMap.get(src));
-                }
+                if (src && linkMap.has(src)) $(el).attr('src', linkMap.get(src));
               });
               $('[href]').each((i, el) => {
                 const href = $(el).attr('href');
-                if (href && linkMap.has(href)) {
-                  $(el).attr('href', linkMap.get(href));
-                }
+                if (href && linkMap.has(href)) $(el).attr('href', linkMap.get(href));
               });
-              // handle srcset (img, source)
               $('[srcset]').each((i, el) => {
                 const srcset = $(el).attr('srcset');
                 if (srcset) {
-                  const parts = srcset.split(',').map(part => {
-                    const [url, ...rest] = part.trim().split(/\s+/);
-                    if (url && linkMap.has(url)) {
-                      return linkMap.get(url) + (rest.length ? ' ' + rest.join(' ') : '');
-                    }
-                    return part.trim();
+                  const parts = srcset.split(',').map(p => {
+                    const [u, ...r] = p.trim().split(/\s+/);
+                    if (u && linkMap.has(u)) return linkMap.get(u) + (r.length ? ' ' + r.join(' ') : '');
+                    return p.trim();
                   });
                   $(el).attr('srcset', parts.join(', '));
                 }
               });
-              const rewrittenHtml = $.html();
-              fs.writeFileSync(path.join(BASE_PATH, 'index.html'), rewrittenHtml);
-
-              await browser.close();
-              browser = null;
-
-              // Try to create ZIP, but do not fail if impossible
-              let zipPath = '';
-              try {
-                const outputZip = path.join(BASE_PATH + '.zip');
-                const output = fs.createWriteStream(outputZip);
-                const archive = archiver('zip', { zlib: { level: 9 } });
-                archive.pipe(output);
-                archive.directory(BASE_PATH, DIR_NAME);
-                await archive.finalize();
-                zipPath = outputZip;
-                console.log('Zip created:', outputZip);
-              } catch (zipErr) {
-                console.warn('Zip creation failed, continuing without ZIP:', zipErr.message);
-              }
-
-              // Output variables for next steps
-              console.log('DIR_NAME=' + DIR_NAME);
-              console.log('ZIP_PATH=' + (zipPath || ''));
-            } catch (err) {
-              console.error('Fetch failed:', err.message);
-              if (browser) await browser.close();
-              // Still output DIR_NAME so that folder can be committed if partially created
-              console.log('DIR_NAME=' + DIR_NAME);
-              console.log('ZIP_PATH=');
+              finalHtml = $.html();
+              fs.writeFileSync(path.join(BASE_PATH, 'index.html'), finalHtml);
             }
-          })();
+          }
+
+          // نوشتن متادیتا داخل پوشه (همیشه حتی در خطا)
+          writeMetadata();
+
+          // زیپ کردن (ضد خطا)
+          let zipPath = '';
+          try {
+            const outputZip = BASE_PATH + '.zip';
+            const output = fs.createWriteStream(outputZip);
+            const archive = archiver('zip', { zlib: { level: 9 } });
+            archive.pipe(output);
+            archive.directory(BASE_PATH, DIR_NAME);
+            await archive.finalize();
+            zipPath = outputZip;
+            console.log('Zip created:', outputZip);
+          } catch (e) {
+            console.warn('Zip failed, will upload folder directly:', e.message);
+          }
+
+          // چاپ متغیرها برای مراحل بعدی
+          console.log('DIR_NAME=' + DIR_NAME);
+          console.log('ZIP_PATH=' + (zipPath || ''));
           " 2>&1 | tee script-output.log
 
       - name: Export environment variables
@@ -189,31 +184,27 @@ jobs:
           ZIP_PATH=$(grep 'ZIP_PATH=' script-output.log | head -1 | cut -d '=' -f2)
           echo "DIR_NAME=$DIR_NAME" >> $GITHUB_ENV
           echo "ZIP_PATH=$ZIP_PATH" >> $GITHUB_ENV
-          echo "DIR_NAME=$DIR_NAME"
+          echo "Folder: fetched_pages/$DIR_NAME"
 
-      - name: Create metadata (always)
+      - name: Commit and push (folder + repo metadata)
         if: always()
         run: |
-          mkdir -p fetched_pages/$DIR_NAME || true
+          # ساختن metadata.json در ریشه (اختیاری برای لاگ)
           cat > metadata.json <<EOF
           {
             "original_url": "${{ github.event.inputs.url }}",
-            "saved_zip": "${{ env.ZIP_PATH }}",
             "directory": "fetched_pages/${{ env.DIR_NAME }}",
+            "zip": "${{ env.ZIP_PATH }}",
             "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           }
           EOF
-
-      - name: Commit and push (folder + metadata)
-        if: always()
-        run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add fetched_pages/ metadata.json
-          git diff --staged --quiet || git commit -m "Add fetched page from ${{ github.event.inputs.url }}"
+          git diff --staged --quiet || git commit -m "Add page snapshot from ${{ github.event.inputs.url }}"
           git push
 
-      - name: Upload artifact (ZIP if available, otherwise directory)
+      - name: Upload artifact (ZIP if exists, else folder)
         if: always() && env.DIR_NAME != ''
         uses: actions/upload-artifact@v4
         with:
