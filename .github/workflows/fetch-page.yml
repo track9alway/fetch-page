@@ -36,14 +36,13 @@ jobs:
 
       - name: Install system dependencies for Playwright
         run: |
-          npx playwright install-deps chromium
-          npx playwright install chromium
+          npx playwright install --with-deps chromium
 
       - name: Fetch & save page (resilient)
         id: fetch
         run: |
           npm install playwright playwright-extra puppeteer-extra-plugin-stealth cheerio archiver
-          node -e "
+          node << 'NODESCRIPT'
           const fs = require('fs');
           const path = require('path');
           const archiver = require('archiver');
@@ -59,9 +58,7 @@ jobs:
           const DIR_NAME = 'fetched_' + TIMESTAMP;
           const BASE_DIR = path.join('fetched_pages', DIR_NAME);
 
-          // ------------------------------------------------------------------
           // 1. همیشه دایرکتوری اصلی و زیرپوشه را بساز (حتی اگر خطا رخ دهد)
-          // ------------------------------------------------------------------
           fs.mkdirSync(BASE_DIR, { recursive: true });
 
           let finalHtml = '<html><body><h1>Page fetch failed</h1><p>See logs for details.</p></body></html>';
@@ -100,15 +97,11 @@ jobs:
             metadata.error = 'Browser launch failed: ' + launchErr.message;
           }
 
-          // ------------------------------------------------------------------
-          // 2. همیشه index.html را بنویس (حتماً وجود دارد)
-          // ------------------------------------------------------------------
+          // 2. همیشه index.html را بنویس
           const indexPath = path.join(BASE_DIR, 'index.html');
           fs.writeFileSync(indexPath, finalHtml);
 
-          // ------------------------------------------------------------------
           // 3. اگر asset وجود داشت، آن‌ها را ذخیره و آدرس‌ها را بازنویسی کن
-          // ------------------------------------------------------------------
           if (assetBuffers.size > 0) {
             const resourceDir = path.join(BASE_DIR, 'resources');
             fs.mkdirSync(resourceDir, { recursive: true });
@@ -117,9 +110,9 @@ jobs:
             for (const [url, buffer] of assetBuffers) {
               try {
                 const parsed = new URL(url);
-                let safeName = parsed.pathname.replace(/[<>:\"|?*\\\n\r]/g, '_');
+                let safeName = parsed.pathname.replace(/[<>:"|?*\\\n\r]/g, '_');
                 if (!safeName || safeName === '/') safeName = 'index';
-                if (parsed.search) safeName += parsed.search.replace(/[<>:\"|?*\\\n\r]/g, '_');
+                if (parsed.search) safeName += parsed.search.replace(/[<>:"|?*\\\n\r]/g, '_');
                 if (safeName.startsWith('/')) safeName = safeName.slice(1);
                 const outPath = path.join(resourceDir, safeName);
                 fs.mkdirSync(path.dirname(outPath), { recursive: true });
@@ -154,14 +147,10 @@ jobs:
             }
           }
 
-          // ------------------------------------------------------------------
           // 4. متادیتا را داخل پوشه بنویس
-          // ------------------------------------------------------------------
           fs.writeFileSync(path.join(BASE_DIR, 'metadata.json'), JSON.stringify(metadata, null, 2));
 
-          // ------------------------------------------------------------------
-          // 5. زیپ کردن (در صورت امکان)
-          // ------------------------------------------------------------------
+          // 5. زیپ کردن
           let zipPath = '';
           try {
             const outputZip = BASE_DIR + '.zip';
@@ -180,13 +169,10 @@ jobs:
             console.warn('Zip failed: ' + e.message);
           }
 
-          // ------------------------------------------------------------------
-          // 6. خروجی برای مراحل بعد (ذخیره در فایل)
-          // ------------------------------------------------------------------
+          // 6. خروجی برای مراحل بعد
           console.log('DIR_NAME=' + DIR_NAME);
-          // نوشتن متغیرها در فایل مخصوص انتقال
           fs.writeFileSync(process.env.GITHUB_OUTPUT, `DIR_NAME=${DIR_NAME}\nZIP_PATH=${zipPath}\n`, { flag: 'a' });
-          " 2>&1
+          NODESCRIPT
         env:
           INPUT_URL: ${{ github.event.inputs.url }}
           INPUT_WAIT_UNTIL: ${{ github.event.inputs.wait_until }}
@@ -195,10 +181,7 @@ jobs:
       - name: Commit and push (folder + repo metadata)
         if: always()
         run: |
-          # اطمینان از وجود دایرکتوری fetched_pages (حتی اگر خالی باشد)
           mkdir -p fetched_pages
-
-          # ساختن metadata.json در ریشه (اختیاری برای لاگ)
           cat > metadata.json <<EOF
           {
             "original_url": "${{ github.event.inputs.url }}",
@@ -211,7 +194,6 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          # اضافه کردن فایل‌ها – اگر fetched_pages خالی نباشد اضافه می‌شود
           git add metadata.json
           if [ -d "fetched_pages" ] && [ -n "$(ls -A fetched_pages 2>/dev/null)" ]; then
             git add fetched_pages/
@@ -219,7 +201,6 @@ jobs:
             echo "⚠️ No fetched_pages content to commit"
           fi
 
-          # Commit فقط در صورت وجود تغییر
           git diff --staged --quiet || git commit -m "Add page snapshot from ${{ github.event.inputs.url }}"
           git push
 
