@@ -1,21 +1,61 @@
-name: Fetch Page
+name: Fetch Page Advanced (curl)
+
 on:
   workflow_dispatch:
     inputs:
       url:
-        description: 'URL to fetch'
+        description: 'URL to fetch (single URL)'
         required: true
+        type: string
+      user_agent:
+        description: 'Custom User-Agent (optional)'
+        required: false
+        default: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
         type: string
 
 jobs:
   fetch:
     runs-on: ubuntu-latest
     steps:
-      - name: Fetch URL
+      - name: Fetch URL with curl
         run: |
-          curl -L -o page.html "${{ github.event.inputs.url }}"
-      - name: Upload artifact
+          set -e
+          URL="${{ github.event.inputs.url }}"
+          UA="${{ github.event.inputs.user_agent }}"
+          
+          # دریافت صفحه و ذخیره محتوا + هدرها
+          curl -L -k -A "$UA" \
+               -w "%{http_code}" \
+               -o page.html \
+               -D headers.txt \
+               --max-time 60 \
+               "$URL" > status_code.txt || true
+
+          # ذخیره URL نهایی بعد از ریدایرکت‌ها
+          echo -n "$(curl -Ls -o /dev/null -w '%{url_effective}' "$URL")" > final_url.txt
+          
+          # ایجاد فایل متادیتا
+          cat > metadata.json <<EOF
+          {
+            "original_url": "$URL",
+            "final_url": "$(cat final_url.txt)",
+            "http_status": $(cat status_code.txt | tr -d '\n'),
+            "user_agent": "$UA",
+            "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          }
+          EOF
+          
+          # اگر صفحه خالی است یا خطا رخ داده، لاگ خطا را ذخیره کن
+          if [ ! -s page.html ]; then
+            echo "Failed to fetch content" > error.log
+          fi
+
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: fetched_page
-          path: page.html
+          path: |
+            page.html
+            metadata.json
+            error.log
+          if-no-files-found: warn
