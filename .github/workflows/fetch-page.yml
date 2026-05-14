@@ -8,12 +8,12 @@ on:
         required: true
         type: string
       wait_until:
-        description: 'Playwright waitUntil condition (load, domcontentloaded, networkidle)'
+        description: 'Playwright waitUntil condition'
         required: false
         default: 'networkidle'
         type: string
       extra_wait:
-        description: 'Extra seconds to wait after page load for dynamic content'
+        description: 'Extra seconds to wait after page load'
         required: false
         default: '2'
         type: string
@@ -22,7 +22,7 @@ permissions:
   contents: write
 
 jobs:
-  fetch-snapshot:
+  fetch-full-page:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -38,7 +38,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install playwright beautifulsoup4 lxml
+          pip install playwright beautifulsoup4
           playwright install chromium
 
       - name: Run fetch script
@@ -49,19 +49,21 @@ jobs:
           EXTRA_WAIT: ${{ github.event.inputs.extra_wait }}
         run: |
           python scripts/fetch_full_page.py
+          echo "ZIP_PATH=$(cat zip_path.txt)" >> $GITHUB_OUTPUT
+          echo "SNAPSHOT_DIR=$(cat snapshot_dir.txt)" >> $GITHUB_OUTPUT
 
       - name: Commit and push ZIP snapshot
-        if: always() && steps.fetch.outputs.zip_path != ''
+        if: success() && steps.fetch.outputs.ZIP_PATH != ''
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add ${{ steps.fetch.outputs.zip_path }}
+          git add "${{ steps.fetch.outputs.ZIP_PATH }}"
           git diff --staged --quiet || git commit -m "Snapshot of ${{ github.event.inputs.url }} at $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
           git push
 
-      - name: Upload ZIP as workflow artifact
-        if: always() && steps.fetch.outputs.zip_path != ''
+      - name: Upload ZIP as artifact
+        if: success() && steps.fetch.outputs.ZIP_PATH != ''
         uses: actions/upload-artifact@v4
         with:
-          name: page_snapshot_${{ github.run_id }}
-          path: ${{ steps.fetch.outputs.zip_path }}
+          name: page_full_${{ github.run_id }}
+          path: ${{ steps.fetch.outputs.ZIP_PATH }}
