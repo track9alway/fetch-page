@@ -8,205 +8,60 @@ on:
         required: true
         type: string
       wait_until:
-        description: 'Playwright waitUntil condition (default: networkidle)'
+        description: 'Playwright waitUntil condition (load, domcontentloaded, networkidle)'
         required: false
         default: 'networkidle'
         type: string
       extra_wait:
-        description: 'Extra seconds to wait after page load (for dynamic content)'
+        description: 'Extra seconds to wait after page load for dynamic content'
         required: false
         default: '2'
         type: string
 
+permissions:
+  contents: write
+
 jobs:
-  fetch-and-save:
+  fetch-snapshot:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
     steps:
-      - name: Checkout repo
+      - name: Checkout repository
         uses: actions/checkout@v4
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
-          node-version: '20'
+          python-version: '3.11'
 
-      - name: Install system dependencies for Playwright
+      - name: Install dependencies
         run: |
-          npx playwright install --with-deps chromium
+          python -m pip install --upgrade pip
+          pip install playwright beautifulsoup4 lxml
+          playwright install chromium
 
-      - name: Fetch & save page (resilient)
+      - name: Run fetch script
         id: fetch
-        run: |
-          npm install playwright playwright-extra puppeteer-extra-plugin-stealth cheerio archiver
-          node --input-type=commonjs << 'NODESCRIPT'
-          const fs = require('fs');
-          const path = require('path');
-          const archiver = require('archiver');
-          const cheerio = require('cheerio');
-          const { chromium } = require('playwright-extra');
-          const stealth = require('puppeteer-extra-plugin-stealth')();
-          chromium.use(stealth);
-
-          const URL = process.env.INPUT_URL;
-          const WAIT_UNTIL = process.env.INPUT_WAIT_UNTIL || 'networkidle';
-          const EXTRA_WAIT = parseInt(process.env.INPUT_EXTRA_WAIT || '2', 10);
-          const TIMESTAMP = new Date().toISOString().replace(/[:.]/g, '-');
-          const DIR_NAME = 'fetched_' + TIMESTAMP;
-          const BASE_DIR = path.join('fetched_pages', DIR_NAME);
-
-          // 1. همیشه دایرکتوری اصلی و زیرپوشه را بساز (حتی اگر خطا رخ دهد)
-          fs.mkdirSync(BASE_DIR, { recursive: true });
-
-          let finalHtml = '<html><body><h1>Page fetch failed</h1><p>See logs for details.</p></body></html>';
-          let assetBuffers = new Map();
-          const metadata = {
-            original_url: URL,
-            timestamp: new Date().toISOString(),
-            status: 'failed'
-          };
-
-          try {
-            const browser = await chromium.launch({ headless: true });
-            const context = await browser.newContext({
-              userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-            });
-            const page = await context.newPage();
-
-            page.on('response', async response => {
-              try {
-                const buffer = await response.body();
-                assetBuffers.set(response.url(), buffer);
-              } catch (_) {}
-            });
-
-            try {
-              await page.goto(URL, { waitUntil: WAIT_UNTIL, timeout: 90000 });
-              if (EXTRA_WAIT > 0) await page.waitForTimeout(EXTRA_WAIT * 1000);
-              finalHtml = await page.content();
-              metadata.status = 'success';
-            } catch (gotoErr) {
-              metadata.error = gotoErr.message;
-              try { finalHtml = await page.content(); } catch (_) {}
-            }
-            await browser.close();
-          } catch (launchErr) {
-            metadata.error = 'Browser launch failed: ' + launchErr.message;
-          }
-
-          // 2. همیشه index.html را بنویس
-          const indexPath = path.join(BASE_DIR, 'index.html');
-          fs.writeFileSync(indexPath, finalHtml);
-
-          // 3. اگر asset وجود داشت، آن‌ها را ذخیره و آدرس‌ها را بازنویسی کن
-          if (assetBuffers.size > 0) {
-            const resourceDir = path.join(BASE_DIR, 'resources');
-            fs.mkdirSync(resourceDir, { recursive: true });
-            const linkMap = new Map();
-
-            for (const [url, buffer] of assetBuffers) {
-              try {
-                const parsed = new URL(url);
-                let safeName = parsed.pathname.replace(/[<>:"|?*\\\n\r]/g, '_');
-                if (!safeName || safeName === '/') safeName = 'index';
-                if (parsed.search) safeName += parsed.search.replace(/[<>:"|?*\\\n\r]/g, '_');
-                if (safeName.startsWith('/')) safeName = safeName.slice(1);
-                const outPath = path.join(resourceDir, safeName);
-                fs.mkdirSync(path.dirname(outPath), { recursive: true });
-                fs.writeFileSync(outPath, buffer);
-                linkMap.set(url, './resources/' + safeName.replace(/\\/g, '/'));
-              } catch (_) {}
-            }
-
-            if (linkMap.size > 0) {
-              const $ = cheerio.load(finalHtml);
-              $('[src]').each((i, el) => {
-                const src = $(el).attr('src');
-                if (src && linkMap.has(src)) $(el).attr('src', linkMap.get(src));
-              });
-              $('[href]').each((i, el) => {
-                const href = $(el).attr('href');
-                if (href && linkMap.has(href)) $(el).attr('href', linkMap.get(href));
-              });
-              $('[srcset]').each((i, el) => {
-                const srcset = $(el).attr('srcset');
-                if (srcset) {
-                  const parts = srcset.split(',').map(p => {
-                    const [u, ...r] = p.trim().split(/\s+/);
-                    if (u && linkMap.has(u)) return linkMap.get(u) + (r.length ? ' ' + r.join(' ') : '');
-                    return p.trim();
-                  });
-                  $(el).attr('srcset', parts.join(', '));
-                }
-              });
-              const newHtml = $.html();
-              fs.writeFileSync(indexPath, newHtml);
-            }
-          }
-
-          // 4. متادیتا را داخل پوشه بنویس
-          fs.writeFileSync(path.join(BASE_DIR, 'metadata.json'), JSON.stringify(metadata, null, 2));
-
-          // 5. زیپ کردن
-          let zipPath = '';
-          try {
-            const outputZip = BASE_DIR + '.zip';
-            const output = fs.createWriteStream(outputZip);
-            const archive = archiver('zip', { zlib: { level: 9 } });
-            await new Promise((resolve, reject) => {
-              output.on('close', resolve);
-              archive.on('error', reject);
-              archive.pipe(output);
-              archive.directory(BASE_DIR, DIR_NAME);
-              archive.finalize();
-            });
-            zipPath = outputZip;
-            console.log('ZIP_PATH=' + zipPath);
-          } catch (e) {
-            console.warn('Zip failed: ' + e.message);
-          }
-
-          // 6. خروجی برای مراحل بعد
-          console.log('DIR_NAME=' + DIR_NAME);
-          fs.writeFileSync(process.env.GITHUB_OUTPUT, `DIR_NAME=${DIR_NAME}\nZIP_PATH=${zipPath}\n`, { flag: 'a' });
-          NODESCRIPT
         env:
-          INPUT_URL: ${{ github.event.inputs.url }}
-          INPUT_WAIT_UNTIL: ${{ github.event.inputs.wait_until }}
-          INPUT_EXTRA_WAIT: ${{ github.event.inputs.extra_wait }}
-
-      - name: Commit and push (folder + repo metadata)
-        if: always()
+          FETCH_URL: ${{ github.event.inputs.url }}
+          WAIT_UNTIL: ${{ github.event.inputs.wait_until }}
+          EXTRA_WAIT: ${{ github.event.inputs.extra_wait }}
         run: |
-          mkdir -p fetched_pages
-          cat > metadata.json <<EOF
-          {
-            "original_url": "${{ github.event.inputs.url }}",
-            "directory": "fetched_pages/${{ steps.fetch.outputs.DIR_NAME }}",
-            "zip": "${{ steps.fetch.outputs.ZIP_PATH }}",
-            "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-          }
-          EOF
+          python scripts/fetch_full_page.py
 
+      - name: Commit and push ZIP snapshot
+        if: always() && steps.fetch.outputs.zip_path != ''
+        run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-          git add metadata.json
-          if [ -d "fetched_pages" ] && [ -n "$(ls -A fetched_pages 2>/dev/null)" ]; then
-            git add fetched_pages/
-          else
-            echo "⚠️ No fetched_pages content to commit"
-          fi
-
-          git diff --staged --quiet || git commit -m "Add page snapshot from ${{ github.event.inputs.url }}"
+          git add ${{ steps.fetch.outputs.zip_path }}
+          git diff --staged --quiet || git commit -m "Snapshot of ${{ github.event.inputs.url }} at $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
           git push
 
-      - name: Upload artifact (ZIP if exists, else folder)
-        if: always() && steps.fetch.outputs.DIR_NAME != ''
+      - name: Upload ZIP as workflow artifact
+        if: always() && steps.fetch.outputs.zip_path != ''
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ steps.fetch.outputs.DIR_NAME }}
-          path: ${{ steps.fetch.outputs.ZIP_PATH != '' && steps.fetch.outputs.ZIP_PATH || format('fetched_pages/{0}', steps.fetch.outputs.DIR_NAME) }}
+          name: page_snapshot_${{ github.run_id }}
+          path: ${{ steps.fetch.outputs.zip_path }}
